@@ -47,9 +47,11 @@ pub fn instantiate(
                 reward: msg.rewards[i],
                 counter: 0u8,
                 approve_tollgate_time: env.block.time,
+                remaining_reward: msg.rewards[i],
             },
         )?;
     }
+
     // Change later
     Ok(Response::new()
         .add_attribute("method", "instantiate")
@@ -89,12 +91,16 @@ pub fn claim_reward(deps: DepsMut, info: MessageInfo, env: Env) -> Result<Respon
     // Determine how many month should this reward be distributed
     let month_reward = cal_reward_month(vesting_info.reward);
 
+    // Check whether user has reward to claim or not
+    if vesting_info.remaining_reward == 0 {
+        return Err(ContractError::RewardHasBeenClaimed());
+    }
+
     // Check if Tollgate is approved from owner less than 3 months
     if vesting_info.approve_tollgate_time.seconds() + MONTH * 3 < env.block.time.seconds() {
         return Err(ContractError::ApproveRequired());
     }
 
-    // let user_reward_amount = VESTING_INFO.load(deps.storage, info.sender.clone())?;
     // Check whether associated user has reward to claim or not
     if vesting_info.reward == 0 {
         return Err(ContractError::NoReward());
@@ -105,12 +111,16 @@ pub fn claim_reward(deps: DepsMut, info: MessageInfo, env: Env) -> Result<Respon
     // Amount factor that user can claim
     // eg. 0 = user can claim 0, 1 = user can claim 1 time
     let amount_factor =
-        (env.block.time.seconds() - starting_time) / MONTH - vesting_info.counter as u64;
+        (env.block.time.seconds() - starting_time) / MONTH - (vesting_info.counter as u64);
     if amount_factor == 0 {
         return Err(ContractError::InvalidClaimPeriod());
     }
 
-    let amount = vesting_info.reward / (month_reward as u128) * (amount_factor as u128);
+    let mut amount = vesting_info.reward / (month_reward as u128) * (amount_factor as u128);
+    if amount_factor + vesting_info.counter as u64 >= month_reward as u64 {
+        amount = vesting_info.remaining_reward;
+    }
+
     let asset = Asset::native("uluna", amount);
 
     VESTING_INFO.update(
@@ -120,13 +130,15 @@ pub fn claim_reward(deps: DepsMut, info: MessageInfo, env: Env) -> Result<Respon
             match state {
                 Some(o) => Ok(VestingInfo {
                     reward: o.reward,
-                    counter: o.counter + 1,
+                    counter: o.counter + amount_factor as u8,
                     approve_tollgate_time: o.approve_tollgate_time,
+                    remaining_reward: o.remaining_reward - amount,
                 }),
                 None => Ok(VestingInfo {
                     reward: 0,
                     counter: 0,
                     approve_tollgate_time: Timestamp::from_seconds(0),
+                    remaining_reward: 0,
                 }),
             }
         },
@@ -167,6 +179,7 @@ pub fn approve(
             reward: vesting_info.reward,
             counter: vesting_info.counter,
             approve_tollgate_time: env.block.time,
+            remaining_reward: vesting_info.remaining_reward,
         },
     )?;
     Ok(Response::new()
@@ -196,6 +209,7 @@ fn query_users_vesting_info(deps: Deps, user: Addr) -> StdResult<VestingInfo> {
         reward: vesting_info.reward,
         counter: vesting_info.counter,
         approve_tollgate_time: vesting_info.approve_tollgate_time,
+        remaining_reward: vesting_info.remaining_reward,
     })
 }
 
@@ -203,7 +217,7 @@ fn query_users_vesting_info(deps: Deps, user: Addr) -> StdResult<VestingInfo> {
 mod tests {
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies_with_balance, mock_env, mock_info};
-    use cosmwasm_std::{coins, from_binary, Addr, BankMsg, CosmosMsg};
+    use cosmwasm_std::{coins, from_binary, Addr, BankMsg, CosmosMsg, Storage};
 
     const DAY: u64 = 60 * 60 * 24;
 
@@ -232,13 +246,21 @@ mod tests {
         );
 
         // Check vesting_info state
-        let alice_vesting_info_res = query(deps.as_ref(), mock_env(), QueryMsg::GetUsersVestingInfo {user: Addr::unchecked("alice")}).unwrap();
+        let alice_vesting_info_res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetUsersVestingInfo {
+                user: Addr::unchecked("alice"),
+            },
+        )
+        .unwrap();
         let alice_vesting_info: VestingInfo = from_binary(&alice_vesting_info_res).unwrap();
         assert_eq!(
             VestingInfo {
                 reward: 10u128,
                 counter: 0u8,
                 approve_tollgate_time: mock_env().block.time,
+                remaining_reward: 10u128
             },
             alice_vesting_info
         );
@@ -255,12 +277,14 @@ mod tests {
             rewards: vec![20u128, 200u128],
         };
         let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
-       
+
         info.sender = Addr::unchecked("owner");
-        
+
         // Approve when tollgate hasn't expired
         env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH);
-        let msg = ExecuteMsg::Approve { user: "alice".to_string() };
+        let msg = ExecuteMsg::Approve {
+            user: "alice".to_string(),
+        };
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
         match res {
             Err(ContractError::TollgateNotExpired {}) => {}
@@ -269,15 +293,25 @@ mod tests {
 
         // Approve when tollgate already expired
         env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH * 3);
-        let msg = ExecuteMsg::Approve { user: "alice".to_string() };
+        let msg = ExecuteMsg::Approve {
+            user: "alice".to_string(),
+        };
         let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
-        let alice_vesting_info_res = query(deps.as_ref(), mock_env(), QueryMsg::GetUsersVestingInfo {user: Addr::unchecked("alice")}).unwrap();
+        let alice_vesting_info_res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetUsersVestingInfo {
+                user: Addr::unchecked("alice"),
+            },
+        )
+        .unwrap();
         let alice_vesting_info: VestingInfo = from_binary(&alice_vesting_info_res).unwrap();
         assert_eq!(
             VestingInfo {
                 reward: 20u128,
                 counter: 0u8,
                 approve_tollgate_time: env.block.time,
+                remaining_reward: 20u128,
             },
             alice_vesting_info
         );
@@ -296,20 +330,23 @@ mod tests {
         let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
 
         // 1 month pass -> able to claim
-        // Alice reward is 20, so need to be distributed in 3 month 
+        // Alice reward is 20, so need to be distributed in 3 month
         // reward per month 20 / 3 ~= 6
         env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH);
         info.sender = Addr::unchecked("alice");
-        let msg = ExecuteMsg::Claim {  };
+        let msg = ExecuteMsg::Claim {};
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
-        assert_eq!(res.messages[0].msg, CosmosMsg::Bank(BankMsg::Send {
-            to_address: "alice".to_string(),
-            amount: coins(6, "uluna"),
-          }));
+        assert_eq!(
+            res.messages[0].msg,
+            CosmosMsg::Bank(BankMsg::Send {
+                to_address: "alice".to_string(),
+                amount: coins(6, "uluna"),
+            })
+        );
 
         // Alice claim again
         env.block.time = Timestamp::from_seconds(env.block.time.seconds() + DAY);
-        let msg = ExecuteMsg::Claim {  };
+        let msg = ExecuteMsg::Claim {};
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
         match res {
             Err(ContractError::InvalidClaimPeriod {}) => {}
@@ -320,19 +357,125 @@ mod tests {
         // ! Fix: shouldn't call this function? directly change state
         env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH * 2 + DAY * 10);
         info.sender = Addr::unchecked("owner");
-        let msg = ExecuteMsg::Approve { user: "alice".to_string() };
+        let msg = ExecuteMsg::Approve {
+            user: "alice".to_string(),
+        };
         let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
 
+        // let vesting_info = VESTING_INFO.load(&mut deps.storage, Addr::unchecked("alice")).unwrap();
+        // VESTING_INFO.save(
+        //     &mut deps.storage,
+        //     Addr::unchecked("owner"),
+        //     &VestingInfo {
+        //         reward: vesting_info.reward,
+        //         counter: vesting_info.counter,
+        //         approve_tollgate_time: env.block.time,
+        //     },
+        // ).unwrap();
 
         // Exacly 3 month pass -> Alice hasn't claim her 2nd month
-        // Alice should recieve reward for her 2 month
+        // Alice should recieve reward for her 2 month and the rest
         info.sender = Addr::unchecked("alice");
-        let msg = ExecuteMsg::Claim {  };
+        let msg = ExecuteMsg::Claim {};
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
-        assert_eq!(res.messages[0].msg, CosmosMsg::Bank(BankMsg::Send {
-            to_address: "alice".to_string(),
-            amount: coins(12, "uluna"),
-          }));
+        assert_eq!(
+            res.messages[0].msg,
+            CosmosMsg::Bank(BankMsg::Send {
+                to_address: "alice".to_string(),
+                amount: coins(14, "uluna"),
+            })
+        );
+
+        // Alice already claims all her reward
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH);
+        let msg = ExecuteMsg::Claim {};
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        match res {
+            Err(ContractError::NoReward {}) => {}
+            _ => panic!("Must return no reward error"),
+        }
     }
 
+    #[test]
+    fn claim_all_at_once() {
+        let mut deps = mock_dependencies_with_balance(&coins(0, "uluna"));
+        let mut info = mock_info("owner", &coins(10000000, "uluna"));
+        let mut env = mock_env();
+        let msg = InstantiateMsg {
+            owner: Addr::unchecked("owner"),
+            users: vec![Addr::unchecked("alice"), Addr::unchecked("bob")],
+            rewards: vec![20u128, 200u128],
+        };
+        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH * 3 + DAY);
+        info.sender = Addr::unchecked("owner");
+        let msg = ExecuteMsg::Approve {
+            user: "alice".to_string(),
+        };
+        let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH * 2);
+        info.sender = Addr::unchecked("alice");
+        let msg = ExecuteMsg::Claim {};
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.messages[0].msg,
+            CosmosMsg::Bank(BankMsg::Send {
+                to_address: "alice".to_string(),
+                amount: coins(20, "uluna"),
+            })
+        );
+    }
+
+    #[test]
+    fn claim_patial_then_all() {
+        let mut deps = mock_dependencies_with_balance(&coins(0, "uluna"));
+        let mut info = mock_info("owner", &coins(10000000, "uluna"));
+        let mut env = mock_env();
+        let msg = InstantiateMsg {
+            owner: Addr::unchecked("owner"),
+            users: vec![Addr::unchecked("alice"), Addr::unchecked("bob")],
+            rewards: vec![20u128, 200u128],
+        };
+        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH);
+        info.sender = Addr::unchecked("alice");
+        let msg = ExecuteMsg::Claim {};
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.messages[0].msg,
+            CosmosMsg::Bank(BankMsg::Send {
+                to_address: "alice".to_string(),
+                amount: coins(6, "uluna"),
+            })
+        );
+
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH * 3);
+        info.sender = Addr::unchecked("owner");
+        let msg = ExecuteMsg::Approve {
+            user: "alice".to_string(),
+        };
+        let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH * 2);
+        info.sender = Addr::unchecked("alice");
+        let msg = ExecuteMsg::Claim {};
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.messages[0].msg,
+            CosmosMsg::Bank(BankMsg::Send {
+                to_address: "alice".to_string(),
+                amount: coins(14, "uluna"),
+            })
+        );
+
+        env.block.time = Timestamp::from_seconds(env.block.time.seconds() + MONTH);
+        let msg = ExecuteMsg::Claim {};
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        match res {
+            Err(ContractError::NoReward {}) => {}
+            _ => panic!("Must return no reward error"),
+        }
+    }
 }

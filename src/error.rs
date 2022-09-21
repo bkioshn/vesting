@@ -27,4 +27,7 @@ pub enum ContractError {
 
     #[error("Invalid claim period")]
     InvalidClaimPeriod(),
+
+    #[error("Reward has been claim")]
+    RewardHasBeenClaimed(),
 }
